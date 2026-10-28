@@ -6,7 +6,7 @@ stdio and owns one debug session at a time:
 
     QEMU (build/qemu-system-arm -M siyi-a8-mini, always from a pflash image)
       <- GDB/MI (gdb-multiarch, persistent)  via the gdbstub on 127.0.0.1
-      <- QMP (unix socket in the run directory) for reset, sensors, events
+      <- QMP (unix socket in a private temp dir) for reset, sensors, events
       <- UART5 encoder-board peer (protocol v2, answers the 6b/13 handshake)
       <- USB VCP firmware shell (protocol v2 func 0xF0 id 0x07)
     UART1-4/6/7 output goes to files in the run directory.
@@ -26,8 +26,19 @@ Design points:
     with -nx and auto-load off, gdb_command only accepts an allow-list of
     read-only commands and rejects $_shell.
 
+Configuration (environment; defaults fit a checkout at <qemu>/.tmp/qemu_mcp):
+    QEMU_BUILD         QEMU build dir with qemu-system-arm and qemu-img
+                       (a tree with the siyi-a8-mini machine)
+    QEMU_BIN, QEMU_IMG override the two binaries individually
+    GDB_BIN            gdb with ARM support (default gdb-multiarch)
+    QEMU_MCP_FIRMWARE  dir with a8-mini-gimbal-<ver>.bin and bootloader.bin
+    SIYI_RE            siyi_a8_mini_re checkout (protocol v2 module, SVD)
+    N32G4FR_SVD        SVD file (default $SIYI_RE/firmware/ghidra/N32G4FR.svd)
+    QEMU_MCP_RUNS      run directories (default <this dir>/runs)
+
 Register with Claude Code:
-    claude mcp add qemu-debug -- python3 /path/to/.tmp/qemu_mcp/server.py
+    claude mcp add qemu-debug -e QEMU_BUILD=... -e QEMU_MCP_FIRMWARE=... \
+        -e SIYI_RE=... -- python3 /path/to/qemu_mcp/server.py
 """
 import collections
 import ctypes
@@ -40,26 +51,38 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TMP = os.path.dirname(HERE)                     # .tmp
-REPO = os.path.dirname(TMP)
-QEMU = os.environ.get("QEMU_BIN", os.path.join(REPO, "build", "qemu-system-arm"))
-QEMU_IMG = os.environ.get("QEMU_IMG", os.path.join(REPO, "build", "qemu-img"))
+# Original layout: this directory is <qemu>/.tmp/qemu_mcp
+_TMP = os.path.dirname(HERE)
+QEMU_BUILD = os.environ.get("QEMU_BUILD",
+                            os.path.join(os.path.dirname(_TMP), "build"))
+QEMU = os.environ.get("QEMU_BIN", os.path.join(QEMU_BUILD, "qemu-system-arm"))
+QEMU_IMG = os.environ.get("QEMU_IMG", os.path.join(QEMU_BUILD, "qemu-img"))
 GDB = os.environ.get("GDB_BIN", shutil.which("gdb-multiarch") or "gdb")
-BIN2ELF = os.path.join(REPO, ".claude", "skills", "n32g4fr-mcu", "scripts",
-                       "bin2elf.py")
-RUNS = os.path.join(HERE, "runs")
-IMAGES = os.path.join(HERE, "images")
+FIRMWARE = os.environ.get("QEMU_MCP_FIRMWARE", _TMP)
+SIYI_RE = os.environ.get("SIYI_RE", os.path.join(_TMP, "siyi_a8_mini_re"))
+os.environ.setdefault("SIYI_RE", SIYI_RE)       # for gdb_svd.DEFAULT_SVD
+RUNS = os.environ.get("QEMU_MCP_RUNS", os.path.join(HERE, "runs"))
+IMAGES = os.path.join(RUNS, "images")
 
-sys.path.insert(0, os.path.join(TMP, "siyi_a8_mini_re", "firmware", "scripts"))
-sys.path.insert(0, TMP)
-from internal_protocol_v2 import (InterProtoV2Packet, pack_packet,  # noqa: E402
-                                  parse_header, unpack_packet)
+sys.path.insert(0, HERE)
 import gdb_svd  # noqa: E402
+
+try:
+    sys.path.insert(0, os.path.join(SIYI_RE, "firmware", "scripts"))
+    from internal_protocol_v2 import (InterProtoV2Packet, pack_packet,
+                                      parse_header, unpack_packet)
+    PROTO_ERROR = None
+except ImportError as e:
+    # Reported by qemu_start, so the server itself still comes up
+    PROTO_ERROR = (f"cannot import internal_protocol_v2 from {SIYI_RE}"
+                   f"/firmware/scripts ({e}); set SIYI_RE to a "
+                   "siyi_a8_mini_re checkout")
 
 VERSIONS = ("0_4_3", "0_4_9", "0_4_12")
 FLASH_BASE, FLASH_SIZE = 0x08000000, 0x80000
@@ -327,7 +350,7 @@ class Gdb:
 
 
 class Qmp:
-    def __init__(self, path, timeout=15):
+    def __init__(self, path, proc, timeout=15):
         end = time.monotonic() + timeout
         while True:
             try:
@@ -336,7 +359,7 @@ class Qmp:
                 break
             except OSError:
                 self.sock.close()
-                if time.monotonic() > end:
+                if proc.poll() is not None or time.monotonic() > end:
                     raise ToolError("QMP socket did not appear")
                 time.sleep(0.05)
         self.f = self.sock.makefile("rw")
@@ -574,9 +597,9 @@ class Session:
         a = self.cfg
         img = a["image"]
         if img in VERSIONS:
-            app = open(os.path.join(TMP, f"a8-mini-gimbal-{img}.bin"), "rb").read()
+            app = read_firmware(f"a8-mini-gimbal-{img}.bin")
             if a["bootloader"]:
-                boot = open(os.path.join(TMP, "bootloader.bin"), "rb").read()
+                boot = read_firmware("bootloader.bin")
                 vtor = FLASH_BASE
             else:
                 # Stand-in for the bootloader: zeros, VTOR preset to the app
@@ -599,14 +622,20 @@ class Session:
         rawf = os.path.join(IMAGES, f"{name}.bin")
         if not os.path.exists(elf) or open(rawf, "rb").read() != raw:
             open(rawf, "wb").write(raw)
-            subprocess.run([sys.executable, BIN2ELF, rawf, "-o", elf,
-                            "--chip", "n32g4fr", "--flash-base",
-                            hex(FLASH_BASE)], check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            write_elf(elf, raw, FLASH_BASE)
         return bytes(data), vtor, elf
 
     def _start(self):
         a = self.cfg
+        if PROTO_ERROR:
+            raise ToolError(PROTO_ERROR)
+        for path, hint in ((QEMU, "set QEMU_BUILD or QEMU_BIN"),
+                           (GDB, "install gdb-multiarch or set GDB_BIN")):
+            if not shutil.which(path):
+                raise ToolError(f"{path} not found: {hint}")
+        if self.mode != "normal" and not shutil.which(QEMU_IMG):
+            raise ToolError(f"{QEMU_IMG} not found (needed for record/"
+                            "replay): set QEMU_BUILD or QEMU_IMG")
         if self.mode == "replay":
             d = os.path.join(RUNS, f"rr-{a['recording']}")
             meta = os.path.join(d, "meta.json")
@@ -629,9 +658,9 @@ class Session:
         self.gdb_port, self.uart5_port, self.vcp_port = (free_port(),
                                                          free_port(),
                                                          free_port())
-        self.qmp_path = os.path.join(self.dir, "qmp.sock")
-        if os.path.exists(self.qmp_path):
-            os.unlink(self.qmp_path)
+        # Unix socket paths are limited to 108 bytes: keep it short
+        self.sock_dir = tempfile.mkdtemp(prefix="qemu-mcp-")
+        self.qmp_path = os.path.join(self.sock_dir, "qmp.sock")
 
         m = f"siyi-a8-mini,vtor={self.vtor:#x}"
         for k in ("uid", "ucid"):
@@ -686,7 +715,7 @@ class Session:
                                      cwd=self.dir, start_new_session=True,
                                      preexec_fn=_pdeathsig)
         try:
-            self.qmp = Qmp(self.qmp_path)
+            self.qmp = Qmp(self.qmp_path, self.qemu)
         except ToolError:
             raise ToolError("QEMU failed to start:\n" + self.qemu_stderr())
 
@@ -751,6 +780,8 @@ class Session:
             except subprocess.TimeoutExpired:
                 self.qemu.kill()
                 self.qemu.wait()
+        if getattr(self, "sock_dir", None):
+            shutil.rmtree(self.sock_dir, ignore_errors=True)
 
     # run control ----------------------------------------------------------
 
@@ -859,6 +890,43 @@ class Session:
             raise ToolError(f"only {len(out)} of {length} bytes readable at "
                             f"{addr:#x}")
         return bytes(out)
+
+
+def read_firmware(name):
+    path = os.path.join(FIRMWARE, name)
+    if not os.path.exists(path):
+        raise ToolError(f"{path} not found: set QEMU_MCP_FIRMWARE to the "
+                        "directory with a8-mini-gimbal-<ver>.bin and "
+                        "bootloader.bin, or pass image=<flash image path>")
+    return open(path, "rb").read()
+
+
+def write_elf(path, data, base):
+    """Minimal ELF32 ARM executable: one loadable .text holding data.
+
+    gdb only needs it for the architecture (memory and code are always
+    read from the target); the entry is the image's reset vector.
+    """
+    shstr = b"\0.text\0.shstrtab\0"
+    ehsize, phsize, shsize = 52, 32, 40
+    text_off = ehsize + phsize
+    shstr_off = text_off + len(data)
+    sh_off = (shstr_off + len(shstr) + 3) & ~3
+    entry = struct.unpack_from("<I", data, 4)[0] if len(data) >= 8 else base
+    eh = struct.pack("<16sHHIIIIIHHHHHH",
+                     b"\x7fELF\x01\x01\x01" + bytes(9), 2, 40, 1, entry,
+                     ehsize, sh_off, 0x05000000, ehsize, phsize, 1,
+                     shsize, 3, 2)
+    ph = struct.pack("<IIIIIIII", 1, text_off, base, base, len(data),
+                     len(data), 5, 4)
+    sh = (bytes(shsize)
+          + struct.pack("<IIIIIIIIII", 1, 1, 6, base, text_off, len(data),
+                        0, 0, 4, 0)
+          + struct.pack("<IIIIIIIIII", 7, 3, 0, 0, shstr_off, len(shstr),
+                        0, 0, 1, 0))
+    with open(path, "wb") as f:
+        f.write(eh + ph + data + shstr)
+        f.write(bytes(sh_off - shstr_off - len(shstr)) + sh)
 
 
 EXC_NAMES = {1: "Reset", 2: "NMI", 3: "HardFault", 4: "MemManage",

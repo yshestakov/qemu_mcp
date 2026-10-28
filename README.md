@@ -10,7 +10,7 @@ flowchart LR
     A["Claude Code / MCP client"] -- "MCP (stdio)" --> M["server.py<br/>one session at a time"]
     M -- spawn --> Q["qemu-system-arm -M siyi-a8-mini<br/>(pflash image)"]
     M -- "GDB/MI, persistent" --> G[gdb-multiarch] -- "gdbstub 127.0.0.1" --> Q
-    M -- "QMP (unix socket in run dir)" --> Q
+    M -- "QMP (unix socket, private temp dir)" --> Q
     M -- "UART5 tcp: encoder-board peer" --> Q
     M -- "USB VCP tcp: firmware shell" --> Q
     M -. reads .-> D["syms/0_4_9.txt, N32G4FR.svd"]
@@ -18,13 +18,42 @@ flowchart LR
 
 ## Setup
 
+You need a QEMU built from
+[qemu-n32g4fr](https://github.com/yshestakov/qemu-n32g4fr) (branch
+`feat/n32g4fr_soc`, which adds the `siyi-a8-mini` machine), a checkout of
+[siyi_a8_mini_re](https://gitlab.com/Ostrovskyi_Volodymyr/siyi_a8_mini_re)
+(protocol v2 module and `N32G4FR.svd`), `gdb-multiarch`, and the firmware
+files, which are not in this repository: `a8-mini-gimbal-<ver>.bin` and,
+for booting through the bootloader, `bootloader.bin` dumped from a device.
+
 ```sh
-claude mcp add qemu-debug -- python3 /home/user/work/qemu_mcp/server.py
+claude mcp add qemu-debug \
+  -e QEMU_BUILD=/abs/path/qemu-n32g4fr/build \
+  -e SIYI_RE=/abs/path/siyi_a8_mini_re \
+  -e QEMU_MCP_FIRMWARE=/abs/path/firmware-dir \
+  -- python3 /abs/path/qemu_mcp/server.py
 ```
 
+| Variable | Meaning |
+|---|---|
+| `QEMU_BUILD` | QEMU build dir (`qemu-system-arm`, `qemu-img`); or `QEMU_BIN`/`QEMU_IMG` |
+| `GDB_BIN` | gdb with ARM support (default `gdb-multiarch`) |
+| `QEMU_MCP_FIRMWARE` | Dir with `a8-mini-gimbal-<ver>.bin` and `bootloader.bin` |
+| `SIYI_RE` | siyi_a8_mini_re checkout |
+| `N32G4FR_SVD` | SVD file (default `$SIYI_RE/firmware/ghidra/N32G4FR.svd`) |
+| `QEMU_MCP_RUNS` | Run directories (default `./runs`) |
+
 Restart Claude Code afterwards; `/mcp` shows the server. The tools appear as
-`mcp__qemu-debug__<tool>`. To try it without an MCP client, use
-`mcp_call.py`, which runs each tool call given as an argument:
+`mcp__qemu-debug__<tool>`. Missing dependencies are reported by
+`qemu_start`.
+
+**Agent skill:** [`skills/qemu-mcp/SKILL.md`](skills/qemu-mcp/SKILL.md)
+teaches a coding agent how to install and use the server (workflows, tool
+reference, troubleshooting). For Claude Code, copy or link it into
+`.claude/skills/qemu-mcp/` of your project or `~/.claude/skills/qemu-mcp/`.
+
+To try it without an MCP client, use `mcp_call.py`, which runs each tool
+call given as an argument (same environment variables):
 
 ```sh
 python3 mcp_call.py --list
@@ -90,7 +119,7 @@ Flash starts fresh for every session.
     HMP's `migrate exec:` and `pmemsave` could run commands or write host
     files.
   - The gdbstub and the chardevs listen on 127.0.0.1. QMP is a unix socket
-    in a 0700 run directory.
+    in a private (0700) temporary directory.
   - gdb runs with `-nx`, auto-load off and history saving off.
   - `gdb_command` accepts only read-only commands (`x`, `print`, `info`,
     `disassemble`, …) and rejects `$_shell` and newlines.
@@ -103,7 +132,9 @@ Flash starts fresh for every session.
 - **Run directories:** `runs/current/` holds the last normal session:
   `qemu.log` (`-d` output), `qemu.stderr`, `uart{1-4,6,7}.log`, and
   `flash.bin`. Each recording has its own `runs/rr-<name>/`.
-- **Images:** `images/` holds the generated flash images and ELFs (cached).
+- **Images:** `runs/images/` caches the generated flash images and ELFs.
+- **`gdb_svd.py`:** the SVD parser, also usable as a gdb plugin
+  (`source gdb_svd.py`, then `svd RCC`).
 - **Symbols:** `syms/` holds the per-version symbol files.
 
 ## Verified
