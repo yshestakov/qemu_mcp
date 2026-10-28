@@ -525,13 +525,14 @@ class Symbols:
         bootloader's Reset_Handler, main, ...) get that prefix."""
         if not os.path.exists(path):
             return
+        known = set(self.by_name)
         for line in open(path):
             parts = line.split(None, 3)
             if len(parts) != 4:
                 continue
             kind, a, size, name = parts
             a, name = int(a, 16), name.strip()
-            if clash_prefix and name.lower() in self.by_name:
+            if clash_prefix and name.lower() in known:
                 name = clash_prefix + name
             if kind == "F":
                 self.funcs.append((a, int(size), name))
