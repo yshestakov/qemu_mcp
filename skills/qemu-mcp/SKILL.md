@@ -29,10 +29,16 @@ a shell (see [Without MCP](#without-mcp)).
    symbols, active exception) or `running`. Then call `run_wait`,
    `run_interrupt`, or do running-target work (`shell`, `link_frames`).
 4. **Locations** are `0x...`, a symbol (`main`, `FUN_08033c70`), or
-   `symbol+0x10`. Symbols exist only for image `0_4_9` (Ghidra export, 1112
-   functions). Every image has landmarks: `bootloader_reset`,
-   `Reset_Handler`, `SystemInit`, `SystemInit_return`, `__main`,
-   `dma_wait_loop`. Use `sym_lookup` to search names or name an address.
+   `symbol+0x10`. App symbols exist only for image `0_4_9` (Ghidra export,
+   1112 functions). Bootloader symbols (142 functions: `app_is_valid`,
+   `app_handoff`, `UpgradeSession_*`, `cmd_*_handler`, ...) are loaded
+   whenever the image starts with the real bootloader (the default
+   `bootloader=true`); its names that the app also has get a `bl_` prefix
+   (`bl_Reset_Handler`, `bl_main`, `bl___main`). Every image has landmarks:
+   `bootloader_reset`, `Reset_Handler`, `SystemInit`, `SystemInit_return`,
+   `__main`, `main`, `dma_wait_loop`. Use `sym_lookup` to search names or
+   name an address. The generated ELF carries the same names, so plain gdb
+   commands (`info symbol`, `x/i`) show them too.
 5. **Fresh flash every session.** Firmware writes to flash (its config pages)
    and `mem_write`s to flash do not persist across `qemu_start`.
 6. **Stop when done** with `qemu_stop` (logs stay in the run directory).
@@ -192,7 +198,7 @@ scenario in one command.
 | `cannot import internal_protocol_v2` | `SIYI_RE` does not point at a siyi_a8_mini_re checkout |
 | `... a8-mini-gimbal-<ver>.bin not found` | Set `QEMU_MCP_FIRMWARE`, or pass `image=<path>` |
 | `target is running: run_interrupt first` | Stop the target before inspecting it |
-| `unknown symbol` | No symbol file for this image (only 0_4_9); use addresses or landmarks |
+| `unknown symbol` | No symbol file for that code (app: only 0_4_9; bootloader: only with `bootloader=true`); use addresses or landmarks |
 | `shell` returns no reply | USB not enumerated yet (run ~3 s first) or the target is stopped |
 | `QEMU exited (end of the recording)` | Replay ran past the recording; `qemu_start mode=replay` again |
 | `gdb_command` "not allowed" | Only read-only commands (`x`, `print`, `info`, `disassemble`, ...); use the typed tools for changes |

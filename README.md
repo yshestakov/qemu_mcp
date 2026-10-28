@@ -13,7 +13,7 @@ flowchart LR
     M -- "QMP (unix socket, private temp dir)" --> Q
     M -- "UART5 tcp: encoder-board peer" --> Q
     M -- "USB VCP tcp: firmware shell" --> Q
-    M -. reads .-> D["syms/0_4_9.txt, N32G4FR.svd"]
+    M -. reads .-> D["syms/*.txt, N32G4FR.svd"]
 ```
 
 ## Setup
@@ -91,9 +91,13 @@ Flash starts fresh for every session.
   Memory, register, `svd` and `disas` tools refuse to run while the target
   is running. `shell`, `link_frames` and `sensor_set` are meant for a
   running target.
-- **Symbols.** The ELFs carry no symbols, so the server resolves names
-  itself. `syms/0_4_9.txt` is the Ghidra export: 1112 functions plus
-  labels. Every image also has landmarks: `bootloader_reset`,
+- **Symbols.** The server resolves names itself and also writes them
+  into the generated ELF's symbol table, so gdb shows them too.
+  `syms/0_4_9.txt` is the app's Ghidra export: 1112 functions plus
+  labels. `syms/bootloader.txt` (142 functions) is loaded whenever the
+  image starts with `bootloader.bin`; its names that the app also has get
+  a `bl_` prefix (`bl_Reset_Handler`, `bl_main`). Every image also has
+  landmarks: `main`, `bootloader_reset`,
   `Reset_Handler`, `SystemInit`, `SystemInit_return`, `__main`,
   `dma_wait_loop`. Locations accept `0x...`, `name` or `name+0x10`, and the
   server's output shows `<name+off>`. Add `syms/<version>.txt`, in the same

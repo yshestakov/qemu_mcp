@@ -10,7 +10,7 @@ Start QEMU (-M siyi-a8-mini) with the firmware, halted at reset by default, and 
 
 | Argument | Type | Description |
 |---|---|---|
-| `image` | string | 0_4_3, 0_4_9 (default, has symbols), 0_4_12, or a path to a raw flash image starting at 0x08000000 |
+| `image` | string | 0_4_3, 0_4_9 (default, has app symbols), 0_4_12, or a path to a raw flash image starting at 0x08000000 |
 | `bootloader` | boolean | Use the real bootloader (default true). False: zeroed bootloader area, VTOR preset to the app at 0x08003800 |
 | `halted` | boolean | Stay halted at the reset vector (default true) |
 | `uid` | string | UID, 24 hex digits (bytes in address order) |

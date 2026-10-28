@@ -15,9 +15,12 @@ Design points:
   * Run control never blocks for long: run_continue returns the stop
     reason or "still running" after timeout_s; run_wait / run_interrupt
     follow up.
-  * The ELFs have no symbols; addresses are resolved here from Ghidra
-    exports in syms/<version>.txt (only 0.4.9 exists), in both
-    directions (break_add main, FUN_08033c70+0x10; pc <name+off>).
+  * Names come from Ghidra exports: syms/<version>.txt (only 0.4.9
+    exists) and syms/bootloader.txt (when the image starts with
+    bootloader.bin; names the app also has get a bl_ prefix). They are
+    resolved here in both directions (break_add main,
+    FUN_08033c70+0x10; pc <name+off>) and written into the generated
+    ELF's symbol table, so gdb sees them too.
   * Determinism: icount=auto|<shift>; mode=record/replay uses QEMU
     record/replay (flash as qcow2 behind blkreplay, snapshot "init") and
     enables reverse_step / reverse_continue in replay.
@@ -98,7 +101,8 @@ LANDMARKS = {
     "0_4_12": {"SystemInit": 0x080171A8, "dma_wait_loop": 0x08015ACA},
 }
 COMMON_LANDMARKS = {"bootloader_reset": 0x080001AC, "Reset_Handler": 0x080039C0,
-                    "SystemInit_return": 0x080039C4, "__main": 0x08003998}
+                    "SystemInit_return": 0x080039C4, "__main": 0x08003998,
+                    "main": 0x080039A0}
 
 LINK_NAMES = {
     0x01: "control?", 0x0B: "get_camera_config", 0x0D: "led_sta",
@@ -511,18 +515,29 @@ class Symbols:
         self.by_name = {}
         self.path = path
         self.landmarks = {}
+        self.files = []
         self.add_landmarks(COMMON_LANDMARKS)
-        if path and os.path.exists(path):
-            for line in open(path):
-                parts = line.split(None, 3)
-                if len(parts) != 4:
-                    continue
-                kind, a, size, name = parts
-                a, name = int(a, 16), name.strip()
-                if kind == "F":
-                    self.funcs.append((a, int(size), name))
-                self.by_name.setdefault(name.lower(), (a, name))
-            self.funcs.sort()
+        if path:
+            self.load(path)
+
+    def load(self, path, clash_prefix=""):
+        """Add a symbol file; with clash_prefix, names already known (the
+        bootloader's Reset_Handler, main, ...) get that prefix."""
+        if not os.path.exists(path):
+            return
+        for line in open(path):
+            parts = line.split(None, 3)
+            if len(parts) != 4:
+                continue
+            kind, a, size, name = parts
+            a, name = int(a, 16), name.strip()
+            if clash_prefix and name.lower() in self.by_name:
+                name = clash_prefix + name
+            if kind == "F":
+                self.funcs.append((a, int(size), name))
+            self.by_name.setdefault(name.lower(), (a, name))
+        self.funcs.sort()
+        self.files.append(os.path.basename(path))
 
     def add_landmarks(self, d):
         for name, addr in d.items():
@@ -570,8 +585,10 @@ class Symbols:
         def sub(m):
             n = self.name(int(m.group(0), 16))
             return f"{m.group(0)} <{n}>" if n else m.group(0)
+        # gdb's own <sym+off> (the ELF has the same names) is replaced
         text = re.sub(r"\s*<_start\+\d+>", "", text)
-        return re.sub(r"0x0?8[0-9a-fA-F]{6}\b", sub, text)
+        return re.sub(r"0x0?8[0-9a-fA-F]{6}\b(?:\s*<[^>\s]*>)?",
+                      lambda m: sub(re.match(r"0x\w+", m.group(0))), text)
 
 
 # --------------------------------------------------------------------------
@@ -616,13 +633,24 @@ class Session:
         data += b"\xff" * (FLASH_SIZE - len(data))
         if img in VERSIONS:
             struct.pack_into("<I", data, APP_VALID_OFF, APP_VALID)
+        self.syms = Symbols(os.path.join(HERE, "syms", f"{img}.txt")
+                            if img in VERSIONS else None)
+        if img in VERSIONS:
+            self.syms.add_landmarks(LANDMARKS[img])
+        # syms/bootloader.txt describes bootloader.bin: load it when the
+        # image starts with that bootloader
+        try:
+            boot = read_firmware("bootloader.bin")
+        except ToolError:
+            boot = None
+        if boot and raw[:len(boot)] == boot:
+            self.syms.load(os.path.join(HERE, "syms", "bootloader.txt"), "bl_")
         # ELF for gdb (architecture; memory always comes from the target)
         os.makedirs(IMAGES, exist_ok=True)
         elf = os.path.join(IMAGES, f"{name}.elf")
         rawf = os.path.join(IMAGES, f"{name}.bin")
-        if not os.path.exists(elf) or open(rawf, "rb").read() != raw:
-            open(rawf, "wb").write(raw)
-            write_elf(elf, raw, FLASH_BASE)
+        open(rawf, "wb").write(raw)
+        write_elf(elf, raw, FLASH_BASE, self.syms.funcs)
         return bytes(data), vtor, elf
 
     def _start(self):
@@ -718,12 +746,6 @@ class Session:
             self.qmp = Qmp(self.qmp_path, self.qemu)
         except ToolError:
             raise ToolError("QEMU failed to start:\n" + self.qemu_stderr())
-
-        ver = a["image"] if a["image"] in VERSIONS else None
-        self.syms = Symbols(os.path.join(HERE, "syms", f"{ver}.txt")
-                            if ver else None)
-        if ver:
-            self.syms.add_landmarks(LANDMARKS[ver])
 
         # The chardev peers connect before the guest runs (-S)
         if self.mode != "replay":
@@ -901,32 +923,49 @@ def read_firmware(name):
     return open(path, "rb").read()
 
 
-def write_elf(path, data, base):
-    """Minimal ELF32 ARM executable: one loadable .text holding data.
+def write_elf(path, data, base, funcs=()):
+    """Minimal ELF32 ARM executable: one loadable .text holding data, plus
+    a symbol table of funcs [(addr, size, name)] (Thumb functions).
 
-    gdb only needs it for the architecture (memory and code are always
-    read from the target); the entry is the image's reset vector.
+    gdb reads memory and code from the target; the ELF gives it the
+    architecture and the symbol names. The entry is the reset vector.
     """
-    shstr = b"\0.text\0.shstrtab\0"
+    shstr = b"\0.text\0.symtab\0.strtab\0.shstrtab\0"
+    strtab = bytearray(b"\0$t\0")
+    # null, $t mapping symbol (local: Thumb code from base), functions
+    syms = [bytes(16), struct.pack("<IIIBBH", 1, base, 0, 0, 0, 1)]
+    for addr, size, name in funcs:
+        syms.append(struct.pack("<IIIBBH", len(strtab), addr | 1, size,
+                                0x12, 0, 1))      # STB_GLOBAL, STT_FUNC
+        strtab += name.encode() + b"\0"
+    symtab = b"".join(syms)
     ehsize, phsize, shsize = 52, 32, 40
     text_off = ehsize + phsize
-    shstr_off = text_off + len(data)
+    sym_off = (text_off + len(data) + 3) & ~3
+    str_off = sym_off + len(symtab)
+    shstr_off = str_off + len(strtab)
     sh_off = (shstr_off + len(shstr) + 3) & ~3
     entry = struct.unpack_from("<I", data, 4)[0] if len(data) >= 8 else base
     eh = struct.pack("<16sHHIIIIIHHHHHH",
                      b"\x7fELF\x01\x01\x01" + bytes(9), 2, 40, 1, entry,
                      ehsize, sh_off, 0x05000000, ehsize, phsize, 1,
-                     shsize, 3, 2)
+                     shsize, 5, 4)
     ph = struct.pack("<IIIIIIII", 1, text_off, base, base, len(data),
                      len(data), 5, 4)
     sh = (bytes(shsize)
           + struct.pack("<IIIIIIIIII", 1, 1, 6, base, text_off, len(data),
                         0, 0, 4, 0)
-          + struct.pack("<IIIIIIIIII", 7, 3, 0, 0, shstr_off, len(shstr),
+          + struct.pack("<IIIIIIIIII", 7, 2, 0, 0, sym_off, len(symtab),
+                        3, 2, 4, 16)
+          + struct.pack("<IIIIIIIIII", 15, 3, 0, 0, str_off, len(strtab),
+                        0, 0, 1, 0)
+          + struct.pack("<IIIIIIIIII", 23, 3, 0, 0, shstr_off, len(shstr),
                         0, 0, 1, 0))
+    out = bytearray(eh + ph + data)
+    out += bytes(sym_off - len(out)) + symtab + strtab + shstr
+    out += bytes(sh_off - len(out)) + sh
     with open(path, "wb") as f:
-        f.write(eh + ph + data + shstr)
-        f.write(bytes(sh_off - shstr_off - len(shstr)) + sh)
+        f.write(out)
 
 
 EXC_NAMES = {1: "Reset", 2: "NMI", 3: "HardFault", 4: "MemManage",
@@ -972,7 +1011,7 @@ ADDR = {"type": "string",
       "mode=record records an execution for deterministic replay; "
       "mode=replay replays it with reverse_step/reverse_continue.",
       {"image": {"type": "string", "description":
-                 "0_4_3, 0_4_9 (default, has symbols), 0_4_12, or a path to "
+                 "0_4_3, 0_4_9 (default, has app symbols), 0_4_12, or a path to "
                  "a raw flash image starting at 0x08000000"},
        "bootloader": {"type": "boolean", "description":
                       "Use the real bootloader (default true). False: zeroed "
@@ -1015,6 +1054,7 @@ def t_start(image="0_4_9", bootloader=True, halted=True, uid=None, ucid=None,
     out = [f"started {s.cfg['image']} ({'bootloader' if s.cfg['bootloader'] else 'app only'}),"
            f" mode {mode}, VTOR {s.vtor:#x}, run dir {s.dir}",
            f"symbols: {len(s.syms.funcs)} functions"
+           + (f" from {', '.join(s.syms.files)}" if s.syms.files else "")
            + ("" if s.syms.funcs else " (only landmarks: "
               + ", ".join(sorted(n for _, n in s.syms.by_name.values())) + ")")]
     out.append(s.wait(0) if not halted else "stopped: " + s.describe_stop())
